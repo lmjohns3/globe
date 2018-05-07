@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+body {
+  background: rgb({{ light.color[0] }}, {{ light.color[1] }}, {{ light.color[2] }});
+}
+</style>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Globe</title>
+<body>
+
+{{ light }}
+
+<input class="color" id="color-r" type="range" value="{{ light.color[0] }}" min="0" max="255">
+<input class="color" id="color-g" type="range" value="{{ light.color[1] }}" min="0" max="255">
+<input class="color" id="color-b" type="range" value="{{ light.color[2] }}" min="0" max="255">
+<input class="color" id="color-w" type="range" value="{{ light.color[3] }}" min="0" max="255">
+
+<script>
+const setColor = function(which) {
+  return function() {
+    console.log(which)
+    let val = function(c) { return document.getElementById(which + "-" + c).value; };
+    let xhr = new XMLHttpRequest();
+    xhr.open("POST", ".");
+    xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+    xhr.send(which + "=" + val("r") + "," + val("g") + "," + val("b") + "," + val("w"));
+  };
+};
+
+let ranges = document.getElementsByClassName("color");
+for (let i = 0; i < ranges.length; ++i) {
+  ranges[i].onchange = setColor(ranges[i].className);
+}
+</script>

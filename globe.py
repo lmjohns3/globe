@@ -1,25 +1,23 @@
-#!/home/pi/globe/venv/bin/python
+#!/home/pi/venv/bin/python
 
 '''Driver for the LED lamp.'''
 
-import Adafruit_SSD1306
-import arrow
-import astral
+import Adafruit_GPIO as GPIO
+import Adafruit_SSD1306 as SSD1306
+import aiohttp.web
+import asyncio
 import atexit
+import bisect
+import contextlib
 import datetime
-import flask
-import gpiozero
+import enum
+import functools
+import logging
 import PIL.Image
 import PIL.ImageDraw
 import PIL.ImageFont
-import queue
 import random
 import _rpi_ws281x as ws
-import threading
-import time
-
-from flask import render_template
-from flask import request
 
 
 def random_rgb():
@@ -28,104 +26,100 @@ def random_rgb():
     return [r(), r(), r(), 0]
 
 
-class LCD(threading.Thread):
-    '''A function for driving an OLED LCD via a command queue.'''
+def profile(f):
+    '''Profile a function's elapsed time.'''
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        f(*args, **kwargs)
+        elapsed = time.time() - start
+        print('{} took {}us'.format(f.__name__, 1000000 * elapsed))
+    return wrapper
+
+
+class LCD:
+    '''A class for driving an OLED LCD.'''
 
     def __init__(self, pin, address, width=128, height=64):
-        super().__init__()
-        
         self.width = width
         self.height = height
 
-        self._disp = Adafruit_SSD1306.SSD1306_128_64(rst=pin, i2c_address=address)
-        self._disp.begin()
+        self._disp = SSD1306.SSD1306_128_64(rst=pin, i2c_address=address)
+        self._disp_begin()
         if (width, height) != (self._disp.width, self._disp.height):
             raise RuntimeError('oled screen size mismatch')
-        
-        self._queue = queue.Queue()
-        self._commands = []
 
-    def run(self):
-        img = PIL.Image.new('1', (self.width, self.height))
-        draw = PIL.ImageDraw.Draw(img)
-        font = PIL.ImageFont.truetype('static/inconsolata.ttf', 48)
-        while True:
-            commands = self._queue.get()
-            if commands is None:
-                break
-            draw.rectangle((0, 0, self.width, self.height), outline=0, fill=0)
-            for shape, coords, fill, outline in commands:
-                if shape == 'rectangle':
-                    draw.rectangle(coords, fill=fill, outline=outline)
-                elif shape == 'ellipse':
-                    draw.ellipse(coords, fill=fill, outline=outline)
-                elif shape == 'line':
-                    draw.line(coords, fill=fill)
-                elif shape == 'polygon':
-                    draw.polygon(coords, fill=fill, outline=outline)
-                else:
-                    draw.text(coords, shape, font=font, fill=fill)
-            self._disp.clear()
-            self._disp.image(img)
-            self._disp.display()
+        self._img = PIL.Image.new('1', (self.width, self.height))
+        self._draw = PIL.ImageDraw.Draw(self._img)
+        self._font = PIL.ImageFont.truetype('static/inconsolata.ttf', 48)
+        self._needs_showing = True
 
-    def show(self):
-        self._queue.put(self._commands)
-        self._commands = []
+    @profile
+    def _disp_begin(self):
+        self._disp.begin()
 
-    def join(self):
-        self._queue.put(None)
-        super().join()
+    @profile
+    def _disp_clear(self):
+        self._disp.clear()
 
-    def rectangle(self, coords, fill=0, outline=1):
-        self._commands.append(('rectangle', coords, fill, outline))
+    @profile
+    def _disp_image(self):
+        self._disp.image()
 
-    def ellipse(self, coords, fill=0, outline=1):
-        self._commands.append(('ellipse', coords, fill, outline))
+    @profile
+    def _disp_display(self):
+        self._disp.display()
 
-    def line(self, coords, fill=1):
-        self._commands.append(('line', coords, fill, 1))
+    async def show(self):
+        if self._needs_showing:
+            self._disp_clear()
+            self._disp_image(self._img)
+            self._disp_display()
+            self._needs_showing = False
 
-    def polygon(self, coords, fill=0, outline=1):
-        self._commands.append(('polygon', coords, fill, outline))
+    async def clear(self):
+        self._draw.rectangle((0, 0, self.width, self.height), outline=0, fill=0)
+        self._needs_showing = True
 
-    def text(self, text, coords, fill=1):
-        self._commands.append((text, coords, fill, 1))
+    async def rectangle(self, coords, fill=0, outline=1):
+        self._draw.rectangle(coords, fill=fill, outline=outline)
+        self._needs_showing = True
 
+    async def ellipse(self, coords, fill=0, outline=1):
+        self._draw.ellipse(coords, fill=fill, outline=outline)
+        self._needs_showing = True
 
-class Gamma:
-    R = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-    G = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-    B = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-    W = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+    async def line(self, coords, fill=1):
+        self._draw.line(coords, fill=fill)
+        self._needs_showing = True
+
+    async def polygon(self, coords, fill=0, outline=1):
+        self._draw.polygon(coords, fill=fill, outline=outline)
+        self._needs_showing = True
+
+    async def text(self, text, coords, fill=1):
+        self._draw.text(coords, shape, font=self._font, fill=fill)
+        self._needs_showing = True
 
 
 class Pixels:
     '''A class representing a strip of NeoPixels.'''
 
+    class Gamma:
+        R = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+        G = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+        B = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+        W = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+
     def __init__(self, size, pin, brightness=128):
         self._size = size
         self._leds = ws.new_ws2811_t()
 
-        for c in range(2):
-            chan = ws.ws2811_channel_get(self._leds, c)
-            ws.ws2811_channel_t_count_set(chan, 0)
-            ws.ws2811_channel_t_gpionum_set(chan, 0)
-            ws.ws2811_channel_t_invert_set(chan, 0)
-            ws.ws2811_channel_t_brightness_set(chan, 0)
-
-        self._channel = ws.ws2811_channel_get(self._leds, 0)
-        ws.ws2811_channel_t_gamma_set(self._channel, list(range(256)))
-        ws.ws2811_channel_t_count_set(self._channel, size)
-        ws.ws2811_channel_t_gpionum_set(self._channel, pin)
-        ws.ws2811_channel_t_invert_set(self._channel, 0)
-        ws.ws2811_channel_t_brightness_set(self._channel, brightness)
-        ws.ws2811_channel_t_strip_type_set(self._channel, ws.SK6812_STRIP_RGBW)
-
-        ws.ws2811_t_freq_set(self._leds, 800000)
-        ws.ws2811_t_dmanum_set(self._leds, 5)
-
         atexit.register(self._cleanup)
+
+        self._ws2811_reset()
+        self._ws2811_setup()
+        self._ws2811_init()
 
     def __del__(self):
         if ws:
@@ -140,118 +134,124 @@ class Pixels:
             ws.delete_ws2811_t(self._leds)
             self._leds = None
 
-    def start(self):
+    @profile
+    def _ws2811_reset(self):
+        for c in range(2):
+            chan = ws.ws2811_channel_get(self._leds, c)
+            ws.ws2811_channel_t_count_set(chan, 0)
+            ws.ws2811_channel_t_gpionum_set(chan, 0)
+            ws.ws2811_channel_t_invert_set(chan, 0)
+            ws.ws2811_channel_t_brightness_set(chan, 0)
+
+    @profile
+    def _ws2811_setup(self):
+        self._channel = ws.ws2811_channel_get(self._leds, 0)
+        ws.ws2811_channel_t_gamma_set(self._channel, list(range(256)))
+        ws.ws2811_channel_t_count_set(self._channel, size)
+        ws.ws2811_channel_t_gpionum_set(self._channel, pin)
+        ws.ws2811_channel_t_invert_set(self._channel, 0)
+        ws.ws2811_channel_t_brightness_set(self._channel, brightness)
+        ws.ws2811_channel_t_strip_type_set(self._channel, ws.SK6812_STRIP_RGBW)
+        ws.ws2811_t_freq_set(self._leds, 800000)
+        ws.ws2811_t_dmanum_set(self._leds, 5)
+
+    @profile
+    def _ws2811_init(self):
         resp = ws.ws2811_init(self._leds)
         if resp != 0:
             str_resp = ws.ws2811_get_return_t_str(resp)
             raise RuntimeError('ws2811_init failed with code '
                                '{} ({})'.format(resp, str_resp))
 
-    def show(self, rgbw):
-        self[:] = rgbw
+    @profile
+    def _ws2811_render(self):
         resp = ws.ws2811_render(self._leds)
         if resp != 0:
             str_resp = ws.ws2811_get_return_t_str(resp)
             raise RuntimeError('ws2811_render failed with code '
                                '{} ({})'.format(resp, str_resp))
 
-    def __getitem__(self, idx):
-        return ws.ws2811_led_get(self._channel, idx)
+    @profile
+    def _ws2811_led_get(self):
+        return [self.int_to_rgbw(ws.ws2811_led_get(self._channel, idx))
+                for idx in range(self._size)]
 
-    def __setitem__(self, idx, rgbw):
-        r, g, b, w = rgbw
-        value = (Gamma.W[w] << 24) | (Gamma.G[g] << 16) | (Gamma.R[r] << 8) | Gamma.B[b]
-        if not isinstance(idx, slice):
-            idx = slice(idx, idx + 1, 1)
+    @profile
+    def _ws2811_led_set(self, idx, value):
         for idx in range(idx.start or 0, idx.stop or len(self), idx.step or 1):
             ws.ws2811_led_set(self._channel, idx, value)
 
+    async def show(self, rgbw):
+        await self.set_color(rgbw)
+        self._ws2811_render()
 
-class Light(threading.Thread):
-    '''A light contains an RGB LED globe, a display, and 6 buttons.'''
+    async def get_colors(self):
+        return self._ws2811_led_get()
 
-    class Mode:
+    async def set_color(self, rgbw, idx=None):
+        if idx is None:
+            idx = slice(None, None, None)
+        if isinstance(idx, int):
+            idx = slice(idx, idx + 1, 1)
+        self._ws2811_led_set(idx, self.rgbw_to_int(rgbw))
+
+    @staticmethod
+    def rgbw_to_int(rgbw):
+        r, g, b, w = rgbw
+        G = Gamma
+        return (G.W[w] << 24) | (G.G[g] << 16) | (G.R[r] << 8) | G.B[b]
+
+    @staticmethod
+    def int_to_rgbw(value):
+        w = bisect.bisect(Gamma.W, (value >> 24) & 0xff)
+        g = bisect.bisect(Gamma.G, (value >> 16) & 0xff)
+        r = bisect.bisect(Gamma.R, (value >> 8) & 0xff)
+        b = bisect.bisect(Gamma.B, value & 0xff)
+        return  r, g, b, w
+
+
+class Globe:
+    '''A globe contains an RGB LED globe, a display, and 6 buttons.'''
+
+    @enum.unique
+    class Mode(enum.Enum):
         RGBW = 0
         WALK = 1
-        NIGHTLIGHT = 2
+        DANCE = 2
+        NIGHTLIGHT = 3
 
-        NUM_MODES = 3
+    def __init__(self, time_override=None):
+        self.on = True
+        self.mode = Mode.RGBW
+        self.color = [0, 0, 0, 255]
+        self.target = None
 
-    def __init__(self):
-        super().__init__()
+        self._time_override = time_override
 
-        self._lock = threading.Lock()
-
-        self._on = True
-        self._mode = Light.Mode.RGBW
-        self._color = [0, 0, 0, 255]
-        self._target = None
-        self._time_override = None
-
-        self._displayed_at = 0
         self._display = LCD(pin=14, address=0x3d)
-        self._display.start()
+        self._pixels = Pixels(size=13, pin=18, brightness=255)
 
-        self._globe = Pixels(size=13, pin=18, brightness=255)
-        self._globe.start()
+        gpio = GPIO.get_platform_gpio()
 
-        self._buttons = []
-        def button(pin, callback):
-            b = gpiozero.Button(pin)
-            b.when_pressed = callback
-            self._buttons.append(b)
-        button(20, self._on_power_pressed)
-        button(19, self._on_mode_pressed)
+        def add_button(pin, coro):
+            wrapped = functools.partial(asyncio.run_coroutine_threadsafe, coro)
+            gpio.setup(pin, gpio.IN)
+            gpio.add_event_detect(pin, gpio.RISING, callback=wrapped, bouncetime=500)
+
+        add_button(20, self._on_power_pressed)
+        add_button(19, self._on_mode_pressed)
         for channel, pin in enumerate((21, 13, 16, 26)):
-            button(pin, self._on_color_pressed(channel))
+            add_button(pin, self._on_color_pressed(channel))
+
+        asyncio.ensure_future(self.clock_loop)
 
     def __str__(self):
         return 'Light<on={}, mode={}, time={}, color={}, target={}>'.format(
                 self.on, self.mode, self.time, self.hexcolor, self.hextarget)
 
     @property
-    def on(self):
-        with self._lock:
-            return self._on
-
-    @on.setter
-    def on(self, on):
-        with self._lock:
-            self._on = on
-
-    @property
-    def mode(self):
-        with self._lock:
-            return self._mode
-
-    @mode.setter
-    def mode(self, mode):
-        with self._lock:
-            self._mode = mode
-
-    @property
-    def color(self):
-        with self._lock:
-            return self._color
-
-    @color.setter
-    def color(self, color):
-        with self._lock:
-            self._color = color
-
-    @property
     def hexcolor(self):
         return ('{:02x}' * 4).format(*self.color)
-
-    @property
-    def target(self):
-        with self._lock:
-            return self._target
-
-    @target.setter
-    def target(self, color):
-        with self._lock:
-            self._target = color
 
     @property
     def hextarget(self):
@@ -259,116 +259,188 @@ class Light(threading.Thread):
 
     @property
     def time(self):
-        with self._lock:
-            return self._time_override or arrow.now()
+        return self._time_override or datetime.datetime.now()
 
     @time.setter
     def time(self, override):
-        with self._lock:
-            self._time_override = override
+        self._time_override = override
+
+    @property
+    def nightlight_color(self):
+        t = self.time
+        is_dusk = t.hour == 19 and t.minute <= 30
+        is_dawn = t.hour == 6 and t.minute >= 55
+        return ((60, 40, 20, 0) if is_dusk else
+                (40, 20, 0, 0) if self.is_night else
+                (20, 60, 40, 0) if is_dawn else
+                self.color)
 
     @property
     def is_night(self):
-        #return False
         return not 7 <= self.time.hour <= 18
 
-    def show(self):
+    async def show(self):
         #print(self)
 
         if not self.on:
-            self._globe.show((0, 0, 0, 0))
-            self._display.show()
+            await self._pixels.show((0, 0, 0, 0))
+            await self._display.clear()
             return
 
-        if self.mode == Light.Mode.NIGHTLIGHT:
-            self._globe.show((40, 20, 0, 0))
-            self._display.show()
+        if self.mode == Mode.NIGHTLIGHT:
+            await self._pixels.show(self.nightlight_color)
+            await self._display.show()
             return
 
-        self._globe.show(self.color)
+        await self._pixels.show(self.color)
 
-        now = time.time()
-        if self.mode != Light.Mode.WALK or now - self._displayed_at > 1:
-            r, g, b, w = self.color
-            text = ('{:x}' * 4).format(r // 16, g // 16, b // 16, w // 16)
-            self._display.text(text, (10, 10), 1)
-            self._display.show()
-            self._displayed_at = now
+        r, g, b, w = self.color
+        text = ('{:x}' * 4).format(r // 16, g // 16, b // 16, w // 16)
+        await self._display.text(text, (10, 10), 1)
+        await self._display.show()
 
-    def run(self):
-        self.show()
-        while True:
-            try:
-                if self.is_night and self.mode != Light.Mode.NIGHTLIGHT:
-                    self.mode = Light.Mode.NIGHTLIGHT
-                    self.show()
-                if self.on and self.mode == Light.Mode.WALK:
-                    self._walk_step_color()
-                time.sleep(1)
-            except KeyboardInterrupt:
-                self._display.join()
-                break
+    async def clock_loop(self):
+        if self.is_night and self.mode != Mode.NIGHTLIGHT:
+            self.mode = Mode.NIGHTLIGHT
+        await asyncio.sleep(60)
+        asyncio.ensure_future(self.clock_loop)
 
-    def _walk_step_color(self):
-        for j, (cchan, tchan) in enumerate(zip(self.color, self.target)):
-            if cchan < tchan:
-                self.color[j] += 1
-            if cchan > tchan:
-                self.color[j] -= 1
-        if self.color == self.target:
-            self.target = random_rgb()
-        self.show()
+    async def walk_loop(self):
+        if self.mode == Mode.WALK:
+            for j, (cchan, tchan) in enumerate(zip(self.color, self.target)):
+                if cchan < tchan:
+                    self.color[j] += 1
+                if cchan > tchan:
+                    self.color[j] -= 1
+            if self.color == self.target:
+                self.target = random_rgb()
+            await self.show()
+            await asyncio.sleep(0.2)
+            asyncio.ensure_future(self.walk_loop)
 
-    def _on_power_pressed(self):
-        self.on = not self.on
-        self.show()
-
-    def _on_mode_pressed(self):
-        if not self.on or self.is_night:
-            return
-        self.mode = (self.mode + 1) % Light.Mode.NUM_MODES
-        if self.mode == Light.Mode.WALK:
+    async def dance_loop(self):
+        if self.mode == Mode.DANCE:
             self.color = random_rgb()
-            self.target = random_rgb()
-        else:
+            await self.show()
+            await asyncio.sleep(2)
+            asyncio.ensure_future(self.dance_loop)
+
+    async def _on_power_pressed(self):
+        self.on = not self.on
+        await self.show()
+
+    async def _on_mode_pressed(self):
+        if self.on and not self.is_night:
+            self.mode = (self.mode + 1) % len(Mode)
             self.target = None
-        self.show()
-        print(self)
+            if self.mode == Mode.WALK:
+                asyncio.ensure_future(self.walk_loop)
+            if self.mode == Mode.DANCE:
+                asyncio.ensure_future(self.dance_loop)
+            await self.show()
+            print(self)
 
     def _on_color_pressed(self, idx):
-        def increment_color():
-            if self.on and self.mode == Light.Mode.RGBW:
+        async def increment_color():
+            if self.on and self.mode == Mode.RGBW:
                 value = self.color[idx]
                 value = (value - (value % 16) + 16) % 256
                 self.color[idx] = value
-                self.show()
-                print(self)
+                await self.show()
         return increment_color
 
 
-app = flask.Flask(__name__)
-light = Light()
+def hex_to_rgbw(x):
+    if x.startswith('#'):
+        x = x[1:]
+    if len(x) == 3:
+        x += '0'
+    if len(x) == 4:
+        return list(int(c, 16) for c in x)
+    if len(x) == 6:
+        x += '00'
+    if len(x) == 8:
+        pairs = x[0:2], x[2:4], x[4:6], x[6:8]
+        return list(int(c, 16) for c in pairs)
+    return None
 
-@app.route('/')
-def index():
-    return render_template('index.html', light=light)
 
-@app.route('/', methods=['POST'])
-def set():
-    #print(sorted(request.form.items()))
-    time = request.form.get('time')
-    if time is not None:
-        light.time = arrow.get(time) if time else None
-    color = request.form.get('color')
-    if color is not None:
-        light.color = [int(c) for c in color.split(',')]
-    target = request.form.get('target')
-    if target is not None:
-        light.target = [int(c) for c in target.split(',')]
-    light.show()
-    return render_template('index.html', light=light)
+HTML = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body {{ background: #000; text-align: center; }}
+#color {{ margin: 1em auto; }}
+</style>
+<title>Globe</title>
+<body>
+
+<div id="color"></div>
+
+<script src="iro.min.js"></script>
+<script>
+(new iro.ColorPicker("#color", {{
+  width: 320,
+  height: 320,
+  color: {{r: {0}, g: {1}, b: {2} }},
+  borderWidth: 1,
+  borderColor: "#fff",
+}})).on("color:change", function(color) {{
+  let xhr = new XMLHttpRequest();
+  xhr.open("POST", ".");
+  xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+  xhr.send("color=" + color.hexString);
+}});
+</script>
+'''
 
 
 if __name__ == '__main__':
-    light.start()
-    app.run(host='0.0.0.0', port=80, debug=False, threaded=False, use_reloader=False)
+    logging.getLogger('asyncio').setLevel(logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG)
+
+    with open('inconsolata.ttf') as handle:
+        font_file = handle.read()
+
+    with open('iro.min.js') as handle:
+        irojs_file = handle.read()
+
+    app = aiohttp.web.Application()
+
+    light = Light()
+
+    async def get(req):
+        return aiohttp.web.Response(HTML.format(*light.color))
+
+    async def post(req):
+        #print(sorted(request.form.items()))
+        data = await request.post()
+        time = data.get('time')
+        if time is not None:
+            light.time = datetime.datetime(time) if time else None
+        color = data.get('color')
+        if color is not None:
+            light.color = hex_to_rgbw(color)
+        target = data.get('target')
+        if target is not None:
+            light.target = hex_to_rgbw(target)
+        asyncio.ensure_future(light.show)
+        return aiohttp.web.Response(HTML.format(*light.color))
+
+    async def font(req):
+        return aiohttp.web.Response(font_file)
+
+    async def irojs(req):
+        return aiohttp.web.Response(irojs_file)
+
+    app.add_routes([
+        aiohttp.web.get('/', get),
+        aiohttp.web.post('/', post),
+        aiohttp.web.get('/inconsolata.ttf', font),
+        aiohttp.web.get('/iro.min.js', irojs),
+    ])
+
+    aiohttp.web.run_app(app)

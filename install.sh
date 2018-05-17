@@ -2,12 +2,12 @@
 
 set -x
 
-cd /home/pi/globe
+cd /home/pi
 
 virtualenv -p python3 venv
 
 . venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r globe/requirements.txt
 
-sudo cp globe.sh /etc/init.d/globe.sh
+sudo cp globe/globe.sh /etc/init.d

@@ -30,9 +30,9 @@ def profile(f):
     '''Profile a function's elapsed time.'''
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        start = time.time()
+        start = datetime.datetime.now()
         f(*args, **kwargs)
-        elapsed = time.time() - start
+        elapsed = (datetime.datetime.now() - start).total_seconds()
         print('{} took {}us'.format(f.__name__, 1000000 * elapsed))
     return wrapper
 
@@ -51,7 +51,7 @@ class LCD:
 
         self._img = PIL.Image.new('1', (self.width, self.height))
         self._draw = PIL.ImageDraw.Draw(self._img)
-        self._font = PIL.ImageFont.truetype('static/inconsolata.ttf', 48)
+        self._font = PIL.ImageFont.truetype('inconsolata.ttf', 48)
         self._needs_showing = True
 
     @profile
@@ -64,7 +64,7 @@ class LCD:
 
     @profile
     def _disp_image(self):
-        self._disp.image()
+        self._disp.image(self._img)
 
     @profile
     def _disp_display(self):
@@ -73,7 +73,7 @@ class LCD:
     async def show(self):
         if self._needs_showing:
             self._disp_clear()
-            self._disp_image(self._img)
+            self._disp_image()
             self._disp_display()
             self._needs_showing = False
 
@@ -102,14 +102,15 @@ class LCD:
         self._needs_showing = True
 
 
+class Gamma:
+    R = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+    G = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+    B = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+    W = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
+
+
 class Pixels:
     '''A class representing a strip of NeoPixels.'''
-
-    class Gamma:
-        R = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-        G = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-        B = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
-        W = [int(0.5 + 255 * (i / 255) ** 2.0) for i in range(256)]
 
     def __init__(self, size, pin, brightness=128):
         self._size = size
@@ -118,7 +119,7 @@ class Pixels:
         atexit.register(self._cleanup)
 
         self._ws2811_reset()
-        self._ws2811_setup()
+        self._ws2811_setup(pin, brightness)
         self._ws2811_init()
 
     def __del__(self):
@@ -144,10 +145,10 @@ class Pixels:
             ws.ws2811_channel_t_brightness_set(chan, 0)
 
     @profile
-    def _ws2811_setup(self):
+    def _ws2811_setup(self, pin, brightness):
         self._channel = ws.ws2811_channel_get(self._leds, 0)
         ws.ws2811_channel_t_gamma_set(self._channel, list(range(256)))
-        ws.ws2811_channel_t_count_set(self._channel, size)
+        ws.ws2811_channel_t_count_set(self._channel, self._size)
         ws.ws2811_channel_t_gpionum_set(self._channel, pin)
         ws.ws2811_channel_t_invert_set(self._channel, 0)
         ws.ws2811_channel_t_brightness_set(self._channel, brightness)
@@ -210,15 +211,16 @@ class Pixels:
         return  r, g, b, w
 
 
+@enum.unique
+class Mode(enum.Enum):
+    RGBW = 0
+    WALK = 1
+    DANCE = 2
+    NIGHTLIGHT = 3
+
+
 class Globe:
     '''A globe contains an RGB LED globe, a display, and 6 buttons.'''
-
-    @enum.unique
-    class Mode(enum.Enum):
-        RGBW = 0
-        WALK = 1
-        DANCE = 2
-        NIGHTLIGHT = 3
 
     def __init__(self, time_override=None):
         self.on = True
@@ -230,20 +232,21 @@ class Globe:
 
         self._display = LCD(pin=14, address=0x3d)
         self._pixels = Pixels(size=13, pin=18, brightness=255)
+        self._last_walk_display = datetime.datetime.now()
 
         gpio = GPIO.get_platform_gpio()
 
         def add_button(pin, coro):
             wrapped = functools.partial(asyncio.run_coroutine_threadsafe, coro)
-            gpio.setup(pin, gpio.IN)
-            gpio.add_event_detect(pin, gpio.RISING, callback=wrapped, bouncetime=500)
+            gpio.setup(pin, GPIO.IN)
+            gpio.add_event_detect(pin, GPIO.RISING, callback=wrapped, bouncetime=500)
 
         add_button(20, self._on_power_pressed)
         add_button(19, self._on_mode_pressed)
         for channel, pin in enumerate((21, 13, 16, 26)):
             add_button(pin, self._on_color_pressed(channel))
 
-        asyncio.ensure_future(self.clock_loop)
+        asyncio.ensure_future(self.clock_loop())
 
     def __str__(self):
         return 'Light<on={}, mode={}, time={}, color={}, target={}>'.format(
@@ -280,11 +283,11 @@ class Globe:
         return not 7 <= self.time.hour <= 18
 
     async def show(self):
-        #print(self)
+        print(self)
 
         if not self.on:
             await self._pixels.show((0, 0, 0, 0))
-            await self._display.clear()
+            await self._display.show()
             return
 
         if self.mode == Mode.NIGHTLIGHT:
@@ -293,17 +296,20 @@ class Globe:
             return
 
         await self._pixels.show(self.color)
+        await self._display.show()
 
+    async def display_color(self):
         r, g, b, w = self.color
         text = ('{:x}' * 4).format(r // 16, g // 16, b // 16, w // 16)
         await self._display.text(text, (10, 10), 1)
-        await self._display.show()
 
     async def clock_loop(self):
         if self.is_night and self.mode != Mode.NIGHTLIGHT:
             self.mode = Mode.NIGHTLIGHT
+            await self._display.clear()
+        await self.show()
         await asyncio.sleep(60)
-        asyncio.ensure_future(self.clock_loop)
+        asyncio.ensure_future(self.clock_loop())
 
     async def walk_loop(self):
         if self.mode == Mode.WALK:
@@ -314,29 +320,39 @@ class Globe:
                     self.color[j] -= 1
             if self.color == self.target:
                 self.target = random_rgb()
+            now = datetime.datetime.now()
+            if (now - self._last_walk_display).total_seconds() > 1:
+                await self._display.clear()
+                await self.display_color()
+                self._last_walk_display = now
             await self.show()
             await asyncio.sleep(0.2)
-            asyncio.ensure_future(self.walk_loop)
+            asyncio.ensure_future(self.walk_loop())
 
     async def dance_loop(self):
         if self.mode == Mode.DANCE:
             self.color = random_rgb()
+            await self._display.clear()
+            await self.display_color()
             await self.show()
-            await asyncio.sleep(2)
-            asyncio.ensure_future(self.dance_loop)
+            await asyncio.sleep(1)
+            asyncio.ensure_future(self.dance_loop())
 
     async def _on_power_pressed(self):
         self.on = not self.on
+        if not self.on:
+            await self._display.clear()
         await self.show()
 
     async def _on_mode_pressed(self):
         if self.on and not self.is_night:
             self.mode = (self.mode + 1) % len(Mode)
+            await self._display.clear()
             self.target = None
             if self.mode == Mode.WALK:
-                asyncio.ensure_future(self.walk_loop)
+                asyncio.ensure_future(self.walk_loop())
             if self.mode == Mode.DANCE:
-                asyncio.ensure_future(self.dance_loop)
+                asyncio.ensure_future(self.dance_loop())
             await self.show()
             print(self)
 
@@ -346,6 +362,8 @@ class Globe:
                 value = self.color[idx]
                 value = (value - (value % 16) + 16) % 256
                 self.color[idx] = value
+                await self._display.clear()
+                await self.display_color()
                 await self.show()
         return increment_color
 
@@ -373,7 +391,7 @@ HTML = '''
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body {{ background: #000; text-align: center; }}
-#color {{ margin: 1em auto; }}
+#color {{ width: 350px; margin: 1em auto; }}
 </style>
 <title>Globe</title>
 <body>
@@ -399,48 +417,48 @@ body {{ background: #000; text-align: center; }}
 
 
 if __name__ == '__main__':
-    logging.getLogger('asyncio').setLevel(logging.DEBUG)
-    logging.basicConfig(level=logging.DEBUG)
+    #logging.getLogger('asyncio').setLevel(logging.DEBUG)
+    #logging.basicConfig(level=logging.DEBUG)
 
-    with open('inconsolata.ttf') as handle:
-        font_file = handle.read()
-
-    with open('iro.min.js') as handle:
+    with open('iro.min.js', 'rb') as handle:
         irojs_file = handle.read()
 
     app = aiohttp.web.Application()
 
-    light = Light()
+    globe = Globe()
 
     async def get(req):
-        return aiohttp.web.Response(HTML.format(*light.color))
+        return aiohttp.web.Response(body=HTML.format(*globe.color),
+                                    content_type='text/html')
 
     async def post(req):
-        #print(sorted(request.form.items()))
-        data = await request.post()
+        data = await req.post()
         time = data.get('time')
         if time is not None:
-            light.time = datetime.datetime(time) if time else None
+            if time:
+                parts = (int(x) for x in re.split(r'\D+', time))
+                globe.time = datetime.datetime(*tuple(parts)[:6])
+            else:
+                globe.time = None
         color = data.get('color')
         if color is not None:
-            light.color = hex_to_rgbw(color)
+            globe.color = hex_to_rgbw(color)
         target = data.get('target')
         if target is not None:
-            light.target = hex_to_rgbw(target)
-        asyncio.ensure_future(light.show)
-        return aiohttp.web.Response(HTML.format(*light.color))
-
-    async def font(req):
-        return aiohttp.web.Response(font_file)
+            globe.target = hex_to_rgbw(target)
+        asyncio.ensure_future(globe.show())
+        return aiohttp.web.Response(body=HTML.format(*globe.color),
+                                    content_type='text/html')
 
     async def irojs(req):
-        return aiohttp.web.Response(irojs_file)
+        return aiohttp.web.Response(body=irojs_file,
+                                    content_type='application/octet-stream')
 
     app.add_routes([
         aiohttp.web.get('/', get),
         aiohttp.web.post('/', post),
-        aiohttp.web.get('/inconsolata.ttf', font),
         aiohttp.web.get('/iro.min.js', irojs),
     ])
 
-    aiohttp.web.run_app(app)
+    aiohttp.web.run_app(app, port=80)
+

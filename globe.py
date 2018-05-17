@@ -237,7 +237,7 @@ class Globe:
         gpio = GPIO.get_platform_gpio()
 
         def add_button(pin, coro):
-            wrapped = functools.partial(asyncio.run_coroutine_threadsafe, coro)
+            wrapped = functools.partial(asyncio.run_coroutine_threadsafe, coro())
             gpio.setup(pin, GPIO.IN)
             gpio.add_event_detect(pin, GPIO.RISING, callback=wrapped, bouncetime=500)
 

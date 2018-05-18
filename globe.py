@@ -19,6 +19,8 @@ import PIL.ImageFont
 import random
 import _rpi_ws281x as ws
 
+_DEBUG = False
+
 
 def random_rgb():
     '''Generate a random triple of ints in [0, 255], with a 0 for white.'''
@@ -33,7 +35,7 @@ def profile(f):
         start = datetime.datetime.now()
         f(*args, **kwargs)
         elapsed = (datetime.datetime.now() - start).total_seconds()
-        print('{} took {:.1f}ms'.format(f.__name__, 1000 * elapsed))
+        logging.debug('{} took {:.1f}ms'.format(f.__name__, 1000 * elapsed))
     return wrapper
 
 
@@ -222,7 +224,7 @@ class Mode(enum.Enum):
 class Globe:
     '''A globe contains an RGB LED string, an LCD display, and 6 buttons.'''
 
-    def __init__(self, loop, time_override=None):
+    def __init__(self, app, time_override=None):
         self.on = True
         self.mode = Mode.RGBW
         self.color = (0, 0, 0, 255)
@@ -237,19 +239,18 @@ class Globe:
         gpio = GPIO.get_platform_gpio()
 
         def add_button(pin, coro):
+            def callback(_):
+                asyncio.run_coroutine_threadsafe(coro(), app.loop)
             gpio.setup(pin, GPIO.IN)
             gpio.add_event_detect(
-                pin,
-                GPIO.RISING,
-                callback=functools.partial(
-                    asyncio.run_coroutine_threadsafe, coro(), loop),
-                bouncetime=500)
+                pin, GPIO.RISING, callback=callback, bouncetime=500)
 
         add_button(20, self._on_power_pressed)
         add_button(19, self._on_mode_pressed)
         for channel, pin in enumerate((21, 13, 16, 26)):
             add_button(pin, self._on_color_pressed(channel))
 
+        asyncio.ensure_future(self.show())
         asyncio.ensure_future(self._clock_loop())
 
     def __str__(self):
@@ -288,7 +289,7 @@ class Globe:
 
     async def show(self):
         now = datetime.datetime.now()
-        refresh_ok = (now - self._last_lcd_refresh).total_seconds() > 0.6
+        refresh_ok = (now - self._last_lcd_refresh).total_seconds() > 0.5
         if not self.on:
             color = (0, 0, 0, 0)
             if refresh_ok:
@@ -310,16 +311,14 @@ class Globe:
         print(self)
 
     async def _redraw_lcd(self):
-        r, g, b, w = self.color
-        text = ('{:x}' * 4).format(r // 16, g // 16, b // 16, w // 16)
-        await self._lcd.text(text, (10, 10), 1)
+        # render the current color as 4 hex digits.
+        await self._lcd.text(self.hexcolor[::2], (10, 10), 1)
 
+        # render empty/filled circles to indicate the mode.
         for i in range(len(Mode) - 1):
-            active = i == self.mode
-            x0, y0 = 115, 2 + i * 12
-            x1, y1 = 125, (i + 1) * 12
-            await self._lcd.ellipse(
-                (x0, y0, x1, y1), fill=active, outline=not active)
+            active = i == self.mode.value
+            x, y = 115, 5 + i * 15
+            await self._lcd.ellipse((x, y, x + 10, y + 10), fill=active, outline=1)
 
     async def _clock_loop(self):
         if self.is_night:
@@ -350,7 +349,7 @@ class Globe:
             await asyncio.sleep(1)
             asyncio.ensure_future(self._dance_loop())
 
-    async def _enable_mode(self):
+    async def ensure_mode(self):
         if self.mode == Mode.WALK:
             asyncio.ensure_future(self._walk_loop())
         if self.mode == Mode.DANCE:
@@ -360,13 +359,13 @@ class Globe:
 
     async def _on_power_pressed(self):
         self.on = not self.on
-        await (self._enable_mode() if self.on else self.show())
+        await (self.ensure_mode() if self.on else self.show())
 
     async def _on_mode_pressed(self):
         if self.on and not self.is_night:
-            self.mode = (self.mode + 1) % len(Mode)
+            self.mode = Mode((self.mode.value + 1) % len(Mode))
             self.target = None
-            await self._enable_mode()
+            await self.ensure_mode()
 
     def _on_color_pressed(self, idx):
         async def increment_color():
@@ -376,7 +375,7 @@ class Globe:
                 value = (value - (value % 16) + 16) % 256
                 color[idx] = value
                 self.color = tuple(color)
-                await self._enable_mode()
+                await self.ensure_mode()
         return increment_color
 
 
@@ -404,7 +403,7 @@ HTML = '''
 <style>
 body {{ background: #000; text-align: center; }}
 #color {{ width: 350px; margin: 1em auto; }}
-#hex {{ width: 350px; margin: 1em auto; color: #fff; font: 3em monospace; }}
+#hex {{ width: 350px; margin: 1em auto; color: #fff; font: 4em monospace; }}
 </style>
 <title>Globe</title>
 <body>
@@ -421,29 +420,32 @@ body {{ background: #000; text-align: center; }}
   borderWidth: 1,
   borderColor: "#fff",
 }})).on("color:change", function(color) {{
+  let hex = color.hexString;
   let xhr = new XMLHttpRequest();
   xhr.open("POST", ".");
   xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-  xhr.send("color=" + color.hexString);
+  xhr.send("color=" + hex);
+  document.getElementById('hex').innerHTML = [hex[1], hex[3], hex[5], '0'].join('');
 }});
 </script>
 '''
 
 
 if __name__ == '__main__':
-    #logging.getLogger('asyncio').setLevel(logging.DEBUG)
-    #logging.basicConfig(level=logging.DEBUG)
+    if _DEBUG:
+        logging.getLogger('asyncio').setLevel(logging.DEBUG)
+        logging.basicConfig(level=logging.DEBUG)
 
     with open('iro.min.js', 'rb') as handle:
         irojs_file = handle.read()
 
     app = aiohttp.web.Application()
 
-    globe = Globe(app.loop)
+    globe = Globe(app)
 
     async def get(req):
         return aiohttp.web.Response(
-            body=HTML.format(globe.hexcolor, *globe.color),
+            body=HTML.format(globe.hexcolor[::2], *globe.color),
             content_type='text/html')
 
     async def post(req):
@@ -458,13 +460,13 @@ if __name__ == '__main__':
         color = data.get('color')
         if color is not None:
             globe.color = hex_to_rgbw(color)
+            globe.mode == Mode.RGBW
         target = data.get('target')
         if target is not None:
             globe.target = hex_to_rgbw(target)
-        asyncio.ensure_future(globe.show())
-        return aiohttp.web.Response(
-            body=HTML.format(globe.hexcolor, *globe.color),
-            content_type='text/html')
+            globe.mode == Mode.WALK
+        asyncio.ensure_future(globe.ensure_mode())
+        return aiohttp.web.Response('ok')
 
     async def irojs(req):
         return aiohttp.web.Response(

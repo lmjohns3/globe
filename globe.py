@@ -23,7 +23,7 @@ import _rpi_ws281x as ws
 def random_rgb():
     '''Generate a random triple of ints in [0, 255], with a 0 for white.'''
     r = lambda: random.randrange(256)
-    return [r(), r(), r(), 0]
+    return r(), r(), r(), 0
 
 
 def profile(f):
@@ -33,7 +33,7 @@ def profile(f):
         start = datetime.datetime.now()
         f(*args, **kwargs)
         elapsed = (datetime.datetime.now() - start).total_seconds()
-        print('{} took {}us'.format(f.__name__, 1000000 * elapsed))
+        print('{} took {:.1f}ms'.format(f.__name__, 1000 * elapsed))
     return wrapper
 
 
@@ -98,7 +98,7 @@ class LCD:
         self._needs_showing = True
 
     async def text(self, text, coords, fill=1):
-        self._draw.text(coords, shape, font=self._font, fill=fill)
+        self._draw.text(coords, text, font=self._font, fill=fill)
         self._needs_showing = True
 
 
@@ -220,33 +220,37 @@ class Mode(enum.Enum):
 
 
 class Globe:
-    '''A globe contains an RGB LED globe, a display, and 6 buttons.'''
+    '''A globe contains an RGB LED string, an LCD display, and 6 buttons.'''
 
-    def __init__(self, time_override=None):
+    def __init__(self, loop, time_override=None):
         self.on = True
         self.mode = Mode.RGBW
-        self.color = [0, 0, 0, 255]
+        self.color = (0, 0, 0, 255)
         self.target = None
 
         self._time_override = time_override
 
-        self._display = LCD(pin=14, address=0x3d)
-        self._pixels = Pixels(size=13, pin=18, brightness=255)
-        self._last_walk_display = datetime.datetime.now()
+        self._lcd = LCD(pin=14, address=0x3d)
+        self._leds = Pixels(size=13, pin=18, brightness=255)
+        self._last_lcd_refresh = datetime.datetime.now()
 
         gpio = GPIO.get_platform_gpio()
 
         def add_button(pin, coro):
-            wrapped = functools.partial(asyncio.run_coroutine_threadsafe, coro())
             gpio.setup(pin, GPIO.IN)
-            gpio.add_event_detect(pin, GPIO.RISING, callback=wrapped, bouncetime=500)
+            gpio.add_event_detect(
+                pin,
+                GPIO.RISING,
+                callback=functools.partial(
+                    asyncio.run_coroutine_threadsafe, coro(), loop),
+                bouncetime=500)
 
         add_button(20, self._on_power_pressed)
         add_button(19, self._on_mode_pressed)
         for channel, pin in enumerate((21, 13, 16, 26)):
             add_button(pin, self._on_color_pressed(channel))
 
-        asyncio.ensure_future(self.clock_loop())
+        asyncio.ensure_future(self._clock_loop())
 
     def __str__(self):
         return 'Light<on={}, mode={}, time={}, color={}, target={}>'.format(
@@ -283,88 +287,96 @@ class Globe:
         return not 7 <= self.time.hour <= 18
 
     async def show(self):
+        now = datetime.datetime.now()
+        refresh_ok = (now - self._last_lcd_refresh).total_seconds() > 0.6
+        if not self.on:
+            color = (0, 0, 0, 0)
+            if refresh_ok:
+                self._last_lcd_refresh = now
+                await self._lcd.clear()
+        elif self.mode == Mode.NIGHTLIGHT:
+            color = self.nightlight_color
+            if refresh_ok:
+                self._last_lcd_refresh = now
+                await self._lcd.clear()
+        else:
+            color = self.color
+            if refresh_ok:
+                self._last_lcd_refresh = now
+                await self._lcd.clear()
+                await self._redraw_lcd()
+        await self._leds.show(color)
+        await self._lcd.show()
         print(self)
 
-        if not self.on:
-            await self._pixels.show((0, 0, 0, 0))
-            await self._display.show()
-            return
-
-        if self.mode == Mode.NIGHTLIGHT:
-            await self._pixels.show(self.nightlight_color)
-            await self._display.show()
-            return
-
-        await self._pixels.show(self.color)
-        await self._display.show()
-
-    async def display_color(self):
+    async def _redraw_lcd(self):
         r, g, b, w = self.color
         text = ('{:x}' * 4).format(r // 16, g // 16, b // 16, w // 16)
-        await self._display.text(text, (10, 10), 1)
+        await self._lcd.text(text, (10, 10), 1)
 
-    async def clock_loop(self):
-        if self.is_night and self.mode != Mode.NIGHTLIGHT:
+        for i in range(len(Mode) - 1):
+            active = i == self.mode
+            x0, y0 = 115, 2 + i * 12
+            x1, y1 = 125, (i + 1) * 12
+            await self._lcd.ellipse(
+                (x0, y0, x1, y1), fill=active, outline=not active)
+
+    async def _clock_loop(self):
+        if self.is_night:
             self.mode = Mode.NIGHTLIGHT
-            await self._display.clear()
-        await self.show()
+            await self.show()
         await asyncio.sleep(60)
-        asyncio.ensure_future(self.clock_loop())
+        asyncio.ensure_future(self._clock_loop())
 
-    async def walk_loop(self):
-        if self.mode == Mode.WALK:
+    async def _walk_loop(self):
+        if self.on and self.mode == Mode.WALK:
+            if self.target is None or self.color == self.target:
+                self.target = random_rgb()
+            color = list(self.color)
             for j, (cchan, tchan) in enumerate(zip(self.color, self.target)):
                 if cchan < tchan:
-                    self.color[j] += 1
+                    color[j] += 1
                 if cchan > tchan:
-                    self.color[j] -= 1
-            if self.color == self.target:
-                self.target = random_rgb()
-            now = datetime.datetime.now()
-            if (now - self._last_walk_display).total_seconds() > 1:
-                await self._display.clear()
-                await self.display_color()
-                self._last_walk_display = now
+                    color[j] -= 1
+            self.color = tuple(color)
             await self.show()
             await asyncio.sleep(0.2)
-            asyncio.ensure_future(self.walk_loop())
+            asyncio.ensure_future(self._walk_loop())
 
-    async def dance_loop(self):
-        if self.mode == Mode.DANCE:
+    async def _dance_loop(self):
+        if self.on and self.mode == Mode.DANCE:
             self.color = random_rgb()
-            await self._display.clear()
-            await self.display_color()
             await self.show()
             await asyncio.sleep(1)
-            asyncio.ensure_future(self.dance_loop())
+            asyncio.ensure_future(self._dance_loop())
+
+    async def _enable_mode(self):
+        if self.mode == Mode.WALK:
+            asyncio.ensure_future(self._walk_loop())
+        if self.mode == Mode.DANCE:
+            asyncio.ensure_future(self._dance_loop())
+        if self.mode == Mode.RGBW:
+            asyncio.ensure_future(self.show())
 
     async def _on_power_pressed(self):
         self.on = not self.on
-        if not self.on:
-            await self._display.clear()
-        await self.show()
+        await (self._enable_mode() if self.on else self.show())
 
     async def _on_mode_pressed(self):
         if self.on and not self.is_night:
             self.mode = (self.mode + 1) % len(Mode)
-            await self._display.clear()
             self.target = None
-            if self.mode == Mode.WALK:
-                asyncio.ensure_future(self.walk_loop())
-            if self.mode == Mode.DANCE:
-                asyncio.ensure_future(self.dance_loop())
-            await self.show()
-            print(self)
+            await self._enable_mode()
 
     def _on_color_pressed(self, idx):
         async def increment_color():
             if self.on and self.mode == Mode.RGBW:
-                value = self.color[idx]
+                color = list(self.color)
+                value = color[idx]
                 value = (value - (value % 16) + 16) % 256
-                self.color[idx] = value
-                await self._display.clear()
-                await self.display_color()
-                await self.show()
+                color[idx] = value
+                self.color = tuple(color)
+                await self._enable_mode()
         return increment_color
 
 
@@ -392,18 +404,20 @@ HTML = '''
 <style>
 body {{ background: #000; text-align: center; }}
 #color {{ width: 350px; margin: 1em auto; }}
+#hex {{ width: 350px; margin: 1em auto; color: #fff; font: 3em monospace; }}
 </style>
 <title>Globe</title>
 <body>
 
 <div id="color"></div>
+<div id="hex">{0}</div>
 
 <script src="iro.min.js"></script>
 <script>
 (new iro.ColorPicker("#color", {{
   width: 320,
   height: 320,
-  color: {{r: {0}, g: {1}, b: {2} }},
+  color: {{r: {1}, g: {2}, b: {3} }},
   borderWidth: 1,
   borderColor: "#fff",
 }})).on("color:change", function(color) {{
@@ -425,11 +439,12 @@ if __name__ == '__main__':
 
     app = aiohttp.web.Application()
 
-    globe = Globe()
+    globe = Globe(app.loop)
 
     async def get(req):
-        return aiohttp.web.Response(body=HTML.format(*globe.color),
-                                    content_type='text/html')
+        return aiohttp.web.Response(
+            body=HTML.format(globe.hexcolor, *globe.color),
+            content_type='text/html')
 
     async def post(req):
         data = await req.post()
@@ -447,12 +462,13 @@ if __name__ == '__main__':
         if target is not None:
             globe.target = hex_to_rgbw(target)
         asyncio.ensure_future(globe.show())
-        return aiohttp.web.Response(body=HTML.format(*globe.color),
-                                    content_type='text/html')
+        return aiohttp.web.Response(
+            body=HTML.format(globe.hexcolor, *globe.color),
+            content_type='text/html')
 
     async def irojs(req):
-        return aiohttp.web.Response(body=irojs_file,
-                                    content_type='application/octet-stream')
+        return aiohttp.web.Response(
+            body=irojs_file, content_type='application/octet-stream')
 
     app.add_routes([
         aiohttp.web.get('/', get),
@@ -461,4 +477,3 @@ if __name__ == '__main__':
     ])
 
     aiohttp.web.run_app(app, port=80)
-

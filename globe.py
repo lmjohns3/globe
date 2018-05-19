@@ -350,12 +350,10 @@ class Globe:
             asyncio.ensure_future(self._dance_loop())
 
     async def ensure_mode(self):
-        if self.mode == Mode.WALK:
-            asyncio.ensure_future(self._walk_loop())
-        if self.mode == Mode.DANCE:
-            asyncio.ensure_future(self._dance_loop())
-        if self.mode == Mode.RGBW:
-            asyncio.ensure_future(self.show())
+        asyncio.ensure_future(
+            self._walk_loop() if self.mode == Mode.WALK else
+            self._dance_loop() if self.mode == Mode.DANCE else
+            self.show())
 
     async def _on_power_pressed(self):
         self.on = not self.on
@@ -459,12 +457,14 @@ if __name__ == '__main__':
                 globe.time = None
         color = data.get('color')
         if color is not None:
-            globe.color = hex_to_rgbw(color)
+            globe.on = True
             globe.mode == Mode.RGBW
+            globe.color = hex_to_rgbw(color)
         target = data.get('target')
         if target is not None:
-            globe.target = hex_to_rgbw(target)
+            globe.on = True
             globe.mode == Mode.WALK
+            globe.target = hex_to_rgbw(target)
         asyncio.ensure_future(globe.ensure_mode())
         return aiohttp.web.Response('ok')
 

@@ -1,14 +1,12 @@
 #!/bin/sh
 
-set -x
+sudo apt-get install libopenjp2-7 libtiff5 ntp
 
-cd /home/pi
+virtualenv -p python3 /home/pi/venv
 
-virtualenv -p python3 venv
+. /home/pi/venv/bin/activate
 
-. venv/bin/activate
-
-pip install -r globe/requirements.txt
+pip install -r /home/pi/globe/requirements.txt
 
 echo 'Now put the following in /etc/rc.local:'
-echo 'sudo /home/pi/globe/globe.sh'
+echo '/home/pi/globe/globe.sh'

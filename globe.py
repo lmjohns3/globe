@@ -466,7 +466,7 @@ if __name__ == '__main__':
             globe.mode == Mode.WALK
             globe.target = hex_to_rgbw(target)
         asyncio.ensure_future(globe.ensure_mode())
-        return aiohttp.web.Response('ok')
+        return aiohttp.web.Response(text='ok')
 
     async def irojs(req):
         return aiohttp.web.Response(

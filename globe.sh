@@ -2,5 +2,5 @@
 
 (
     cd /home/pi/globe
-    python ./globe.py &
+    sudo ./globe.py 1>/dev/null 2>/dev/null &
 )

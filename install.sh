@@ -10,4 +10,5 @@ virtualenv -p python3 venv
 
 pip install -r globe/requirements.txt
 
-sudo cp globe/globe.sh /etc/init.d
+echo 'Now put the following in /etc/rc.local:'
+echo 'sudo /home/pi/globe/globe.sh'

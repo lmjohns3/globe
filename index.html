@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { background: #000; text-align: center; }
+#color { width: 350px; margin: 1em auto; }
+#hex { width: 350px; margin: 1em auto; color: #fff; font: 4em monospace; }
+#offset { width: 100px; margin: 1em auto; }
+</style>
+<title>Globe</title>
+<body>
+
+<div id="color"></div>
+<div id="hex"></div>
+<button id="offset"></button>
+
+<script src="iro.min.js"></script>
+<script>
+var now = null;
+var offset = 0;
+
+document.getElementById("offset").click = () => {
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/state");
+  xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+  xhr.send("offset=" + 1);
+};
+
+const picker = new iro.ColorPicker("#color", {
+  width: 320,
+  height: 320,
+  color: {r: 0, g: 0, b: 0},
+  borderWidth: 1,
+  borderColor: "#fff",
+});
+
+const debounce = (func, wait) => {
+  let timeout;
+  return () => {
+    const self = this, args = arguments;
+    if (!timeout) {
+      timeout = setTimeout(() => { timeout = null; }, wait);
+      func.apply(self, args);
+    }
+  };
+};
+
+picker.on("color:change", debounce(color => {
+  const hex = color.hexString;
+  document.getElementById("hex").innerHTML = hex;
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/state");
+  xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+  xhr.send("color=" + hex);
+}, 200));
+
+setInterval(() => {
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", "/state");
+  xhr.success(resp => {
+    const json = parseJson(resp.text);
+    now = json.now;
+    offset = json.offset;
+    picker.color = json.color;
+    document.getElementById("offset").innerHTML =
+      new Date(new Date(json.now).getTime() + 1000 * json.offset).toTimeString();
+  });
+}, 3000);
+</script>

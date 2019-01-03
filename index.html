@@ -53,7 +53,7 @@ const post = value => {
   xhr.send(value);
 };
 
-document.getElementById("now").click = () => {
+document.getElementById("now").onclick = () => {
   post("offset=" + parseInt(browserSeconds - globeSeconds));
 };
 
@@ -79,11 +79,11 @@ const sync = () => {
     const json = xhr.response;
     globeSeconds = new Date(json.now).getTime() / 1000;
     browserSeconds = new Date().getTime() / 1000;
-    picker.color.rgb = iro.Color.parseHexStr("#" + json.color.slice(0, 6));
     for (let i = 0; i < 4; i++) {
       const el = document.getElementById("mode-toggle-" + i);
       el.className = i == json.mode ? "current" : "";
     }
+    picker.color.rgb = iro.Color.parseHexStr("#" + json.color.slice(0, 6));
     document.getElementById("hex").innerHTML = json.color;
   };
   xhr.send();

@@ -14,12 +14,15 @@ import sys
 
 import globe
 
-HM = collections.namedtuple('HM', 'h m')
+class HM(collections.namedtuple('HM', 'h m')):
+
+    def __str__(self):
+        return '{}.{}'.format(self.h, self.m)
 
 
 if __name__ == '__main__':
-    logging.getLogger('asyncio').setLevel(logging.DEBUG)
-    logging.basicConfig(level=logging.DEBUG)
+    #logging.getLogger('asyncio').setLevel(logging.DEBUG)
+    #logging.basicConfig(level=logging.DEBUG)
 
     session = aiohttp.ClientSession()
 
@@ -27,9 +30,9 @@ if __name__ == '__main__':
     proc = None
     offset = 0
     managed_colors = {
-        HM( 6, 45): '#00202000',
-        HM(19,  0): '#40404040',
-        HM(19, 15): '#10000000',
+        HM( 7,  0): '00201000',
+        HM(19,  0): '20200020',
+        HM(19, 30): '20100000',
     }
 
     # Globe subprocess controls.
@@ -47,7 +50,10 @@ if __name__ == '__main__':
         mode = m
         if proc:
             proc.terminate()
-        proc = await asyncio.create_subprocess_exec(sys.executable, 'globe.py', str(m.value))
+        cmd = (sys.executable, 'globe.py', str(m.value))
+        logging.info('starting globe: %s', cmd)
+        proc = await asyncio.create_subprocess_exec(*cmd)
+
     if not is_managed():
         asyncio.ensure_future(start(globe.Mode.RGBW))
 
@@ -55,6 +61,8 @@ if __name__ == '__main__':
         if is_managed():
             if mode != globe.Mode.MANAGED:
                 await start(globe.Mode.MANAGED)
+            t = datetime.datetime.now() + datetime.timedelta(seconds=offset)
+            now = HM(t.hour, t.minute)
             color, delay = None, 1e100
             for hm, c in managed_colors.items():
                 d = 60 * (now.h - hm.h) + (now.m - hm.m)
@@ -66,7 +74,13 @@ if __name__ == '__main__':
     asyncio.ensure_future(loop())
 
     async def set_color(c):
-        await session.post('http://localhost:8888/color', data=dict(color=c))
+        data = dict(color=c)
+        for i in range(10):
+            try:
+                await session.post('http://localhost:8888/color', data=data)
+                break
+            except:
+                await asyncio.sleep(3)
 
     async def get_color():
         async with session.get('http://localhost:8888/color') as resp:
@@ -85,10 +99,10 @@ if __name__ == '__main__':
             pin, GPIO.RISING, callback=callback, bouncetime=300)
 
     async def on_power_pressed():
-        await asyncio.sleep(0.001)  # Currently doesn't do anything.
+        pass
     add_button(20, on_power_pressed)
 
-    async def on_mode_pressed(self):
+    async def on_mode_pressed():
         if not is_managed():
             next_mode = (mode.value + 1) % len(globe.Mode)
             await start(globe.Mode(next_mode or 1))
@@ -111,6 +125,8 @@ if __name__ == '__main__':
                 color=await get_color(),
                 now=datetime.datetime.now().isoformat(),
                 offset=offset,
+                mode=mode.value,
+                managed_colors={str(k): v for k, v in managed_colors.items()},
             )),
             content_type='text/json')
 
@@ -119,12 +135,12 @@ if __name__ == '__main__':
         data = await req.post()
         if 'offset' in data:
             offset = int(data['offset'])
-        if 'color' in data:
+        if 'color' in data and not is_managed():
             start(globe.Mode.RGBW)
             await set_color(data['color'])
         return aiohttp.web.Response(text='ok')
 
-    with open('iro.js', 'rb') as handle:
+    with open('iro.min.js', 'rb') as handle:
         irojs_file = handle.read()
 
     async def irojs(req):

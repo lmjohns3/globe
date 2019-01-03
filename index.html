@@ -4,28 +4,57 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-body { background: #000; text-align: center; }
-#color { width: 350px; margin: 1em auto; }
-#hex { width: 350px; margin: 1em auto; color: #fff; font: 4em monospace; }
-#offset { width: 100px; margin: 1em auto; }
+body {
+  background: #111;
+  color: #eee;
+  text-align: center;
+}
+
+div { width: 320px; margin: 32px auto; }
+
+#now { font-size: 3em; }
+
+#mode span {
+  display: inline-block;
+  width: 40px;
+  height: 40px;
+  margin-right: 10px;
+  border: solid 2px #eee;
+  border-radius: 22px;
+}
+
+#mode span.current { background: #eee; }
+
+#hex { font: 3em monospace; }
 </style>
 <title>Globe</title>
 <body>
 
+<div id="now">🕖</div>
+<div id="mode">
+  <span id="mode-toggle-0"></span>
+  <span id="mode-toggle-1"></span>
+  <span id="mode-toggle-2"></span>
+  <span id="mode-toggle-3"></span>
+</div>
 <div id="color"></div>
 <div id="hex"></div>
-<button id="now"></button>
+<div id="managed"></div>
 
 <script src="/iro.js"></script>
 <script>
-var now = null;
-var offset = 0;
+var globeSeconds = null;
+var browserSeconds = null;
 
-document.getElementById("now").click = () => {
+const post = value => {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/state");
   xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-  xhr.send("offset=" + 1);
+  xhr.send(value);
+};
+
+document.getElementById("now").click = () => {
+  post("offset=" + parseInt(browserSeconds - globeSeconds));
 };
 
 const picker = new iro.ColorPicker("#color", {
@@ -33,37 +62,32 @@ const picker = new iro.ColorPicker("#color", {
   height: 320,
   color: {r: 0, g: 0, b: 0},
   borderWidth: 1,
-  borderColor: "#fff",
+  borderColor: "#eee",
 });
 
-picker.on("color:change", (() => {
-  let timeout;
-  return color => {
-    if (!timeout) {
-      timeout = setTimeout(() => { timeout = null; }, wait);
-      const hex = color.hexString;
-      document.getElementById("hex").innerHTML = hex;
-      const xhr = new XMLHttpRequest();
-      xhr.open("POST", "/state");
-      xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-      xhr.send("color=" + hex);
-    }
-  };
-})());
+picker.on("input:end", color => {
+  const hex = color.hexString;
+  document.getElementById("hex").innerHTML = hex;
+  post("color=" + hex);
+});
 
-setInterval(() => {
-const xhr = new XMLHttpRequest();
+const sync = () => {
+  const xhr = new XMLHttpRequest();
   xhr.responseType = "json";
   xhr.open("GET", "/state");
   xhr.onload = () => {
-    console.log(xhr);
     const json = xhr.response;
-    now = json.now;
-    offset = json.offset;
+    globeSeconds = new Date(json.now).getTime() / 1000;
+    browserSeconds = new Date().getTime() / 1000;
     picker.color.rgb = iro.Color.parseHexStr("#" + json.color.slice(0, 6));
-    document.getElementById("now").innerHTML =
-      new Date(new Date().getTime() + 1000 * offset).toTimeString();
+    for (let i = 0; i < 4; i++) {
+      const el = document.getElementById("mode-toggle-" + i);
+      el.className = i == json.mode ? "current" : "";
+    }
+    document.getElementById("hex").innerHTML = json.color;
   };
   xhr.send();
-}, 10000);
+};
+
+sync();
 </script>

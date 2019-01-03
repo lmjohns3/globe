@@ -10,14 +10,34 @@ import atexit
 import bisect
 import contextlib
 import datetime
+import enum
+import functools
 import logging
 import PIL.Image
 import PIL.ImageDraw
 import PIL.ImageFont
 import random
 import _rpi_ws281x as ws
+import sys
 
-from . import common
+
+def profile(f):
+    '''Profile a function's elapsed time.'''
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        start = datetime.datetime.now()
+        f(*args, **kwargs)
+        elapsed = (datetime.datetime.now() - start).total_seconds()
+        logging.debug('{} took {:.1f}ms'.format(f.__name__, 1000 * elapsed))
+    return wrapper
+
+
+@enum.unique
+class Mode(enum.Enum):
+    MANAGED = 0
+    RGBW = 1
+    LAVA = 2
+    FIREWORKS = 3
 
 
 def random_rgb():
@@ -46,33 +66,37 @@ class LCD:
 
     def __init__(self, pin, address):
         self._disp = SSD1306.SSD1306_128_64(rst=pin, i2c_address=address)
-        self._disp_begin()
+        self._disp.begin()
 
         self._img = PIL.Image.new('1', (self._disp.width, self._disp.height))
         self._draw = PIL.ImageDraw.Draw(self._img)
         self._font = PIL.ImageFont.truetype('inconsolata.ttf', 48)
 
-    @common.profile
-    def _disp_begin(self):
-        self._disp.begin()
-
-    @common.profile
-    def _disp_clear(self):
+    @profile
+    def _sync_clear(self):
         self._disp.clear()
 
-    @common.profile
-    def _disp_image(self):
+    @profile
+    def _sync_image(self):
         self._disp.image(self._img)
 
-    @common.profile
-    def _disp_display(self):
+    @profile
+    def _sync_display(self):
         self._disp.display()
 
-    @common.profile
+    async def _clear(self):
+        self._sync_clear()
+
+    async def _image(self):
+        self._sync_image()
+
+    async def _display(self):
+        self._sync_display()
+
     async def show(self):
-        self._disp_clear()
-        self._disp_image()
-        self._disp_display()
+        await self._clear()
+        await self._image()
+        await self._display()
 
     async def clear(self):
         self._draw.rectangle((0, 0, self._disp.width, self._disp.height),
@@ -168,7 +192,7 @@ class Pixels:
         return [self.int_to_rgbw(ws.ws2811_led_get(self._channel, idx))
                 for idx in range(self._size)]
 
-    @common.profile
+    @profile
     def _ws2811_led_set(self, idx, value):
         for idx in range(idx.start or 0, idx.stop or len(self), idx.step or 1):
             ws.ws2811_led_set(self._channel, idx, value)
@@ -207,11 +231,12 @@ class Globe:
 
     def __init__(self, app, mode):
         self.mode = mode
-        self.color = (0, 0, 0, 255) if mode == common.Mode.RGBW else random_rgb()
+        self.color = (0, 0, 0, 255) if mode == Mode.RGBW else random_rgb()
         self.target = None
 
         self._lcd = LCD(pin=14, address=0x3d)
         self._leds = Pixels(size=13, pin=18, brightness=255)
+        self._last_lcd_refresh = datetime.datetime.now()
 
         gpio = GPIO.get_platform_gpio()
 
@@ -225,39 +250,39 @@ class Globe:
         for channel, pin in enumerate((21, 13, 16, 26)):
             add_button(pin, self._on_color_pressed(channel))
 
-        asyncio.ensure_future(
-            self._walk_loop() if mode == common.Mode.WALK else
-            self._dance_loop() if mode == common.Mode.DANCE else
-            self.show())
+        if mode == Mode.RGBW:
+            asyncio.ensure_future(self.show())
+        elif mode == Mode.LAVA:
+            asyncio.ensure_future(self._lava_loop())
+        elif mode == Mode.FIREWORKS:
+            asyncio.ensure_future(self._fireworks_loop())
 
     @property
     def hexcolor(self):
         return ''.join('{:02x}'.format(c) for c in self.color)
 
     async def show(self):
-        asyncio.ensure_future(self._redraw_lcd())
+        now = datetime.datetime.now()
+        if (now - self._last_lcd_refresh).total_seconds() < 0.5:
+            asyncio.ensure_future(self._redraw_lcd())
+            self._last_lcd_refresh = now
         await self._leds.show(self.color)
 
     async def _redraw_lcd(self):
-        now = datetime.datetime.now()
-        if (now - self._last_lcd_refresh).total_seconds() < 0.5:
-            return
-
         await self._lcd.clear()
 
         # render the current color as 4 hex digits.
         await self._lcd.text(self.hexcolor[::2], (10, 10), 1)
 
         # render empty/filled circles to indicate the mode.
-        for i in range(len(common.Mode) - 1):
+        for i in range(len(Mode) - 1):
             active = i == self.mode.value
             x, y = 115, 5 + i * 15
             await self._lcd.ellipse((x, y, x + 10, y + 10), fill=active, outline=1)
 
         await self._lcd.show()
-        self._last_lcd_refresh = now
 
-    async def _walk_loop(self):
+    async def _lava_loop(self):
         if self.target is None or self.color == self.target:
             self.target = random_rgb()
         color = list(self.color)
@@ -269,17 +294,17 @@ class Globe:
         self.color = tuple(color)
         asyncio.ensure_future(self.show())
         await asyncio.sleep(0.1)
-        asyncio.ensure_future(self._walk_loop())
+        asyncio.ensure_future(self._lava_loop())
 
-    async def _dance_loop(self):
-        self.color = common.random_rgb()
+    async def _fireworks_loop(self):
+        self.color = random_rgb()
         asyncio.ensure_future(self.show())
         await asyncio.sleep(1)
-        asyncio.ensure_future(self._dance_loop())
+        asyncio.ensure_future(self._fireworks_loop())
 
     def _on_color_pressed(self, idx):
         async def increment_color():
-            if self.mode == common.Mode.RGBW:
+            if self.mode == Mode.RGBW:
                 color = list(self.color)
                 value = color[idx]
                 value = (value - (value % 16) + 16) % 256
@@ -290,24 +315,24 @@ class Globe:
 
 
 if __name__ == '__main__':
-    if _DEBUG:
-        logging.getLogger('asyncio').setLevel(logging.DEBUG)
-        logging.basicConfig(level=logging.DEBUG)
+    #logging.getLogger('asyncio').setLevel(logging.DEBUG)
+    #logging.basicConfig(level=logging.DEBUG)
 
     app = aiohttp.web.Application()
 
-    globe = Globe(app, common.Mode(int(sys.argv[2])))
+    globe = Globe(app, Mode(int(sys.argv[1])))
 
     async def get_color(req):
         return aiohttp.web.Response(body=globe.hexcolor,
                                     content_type='text/plain')
 
     async def set_color(req):
-        globe.color = hex_to_rgbw(await req.post())
-        await globe.show()
+        data = await req.post()
+        globe.color = hex_to_rgbw(data['color'])
+        asyncio.ensure_future(globe.show())
         return aiohttp.web.Response(text='ok')
 
-    app.add_routes([aiohttp.web.get('/color', get),
-                    aiohttp.web.post('/color', post)])
+    app.add_routes([aiohttp.web.get('/color', get_color),
+                    aiohttp.web.post('/color', set_color)])
 
     aiohttp.web.run_app(app, port=8888)

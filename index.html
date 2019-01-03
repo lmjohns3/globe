@@ -14,14 +14,14 @@ body { background: #000; text-align: center; }
 
 <div id="color"></div>
 <div id="hex"></div>
-<button id="offset"></button>
+<button id="now"></button>
 
-<script src="iro.min.js"></script>
+<script src="/iro.js"></script>
 <script>
 var now = null;
 var offset = 0;
 
-document.getElementById("offset").click = () => {
+document.getElementById("now").click = () => {
   const xhr = new XMLHttpRequest();
   xhr.open("POST", "/state");
   xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
@@ -36,36 +36,34 @@ const picker = new iro.ColorPicker("#color", {
   borderColor: "#fff",
 });
 
-const debounce = (func, wait) => {
+picker.on("color:change", (() => {
   let timeout;
-  return () => {
-    const self = this, args = arguments;
+  return color => {
     if (!timeout) {
       timeout = setTimeout(() => { timeout = null; }, wait);
-      func.apply(self, args);
+      const hex = color.hexString;
+      document.getElementById("hex").innerHTML = hex;
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/state");
+      xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+      xhr.send("color=" + hex);
     }
   };
-};
-
-picker.on("color:change", debounce(color => {
-  const hex = color.hexString;
-  document.getElementById("hex").innerHTML = hex;
-  const xhr = new XMLHttpRequest();
-  xhr.open("POST", "/state");
-  xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
-  xhr.send("color=" + hex);
-}, 200));
+})());
 
 setInterval(() => {
-  const xhr = new XMLHttpRequest();
+const xhr = new XMLHttpRequest();
+  xhr.responseType = "json";
   xhr.open("GET", "/state");
-  xhr.success(resp => {
-    const json = parseJson(resp.text);
+  xhr.onload = () => {
+    console.log(xhr);
+    const json = xhr.response;
     now = json.now;
     offset = json.offset;
-    picker.color = json.color;
-    document.getElementById("offset").innerHTML =
-      new Date(new Date(json.now).getTime() + 1000 * json.offset).toTimeString();
-  });
-}, 3000);
+    picker.color.rgb = iro.Color.parseHexStr("#" + json.color.slice(0, 6));
+    document.getElementById("now").innerHTML =
+      new Date(new Date().getTime() + 1000 * offset).toTimeString();
+  };
+  xhr.send();
+}, 10000);
 </script>

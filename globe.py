@@ -270,13 +270,15 @@ class Globe:
 
     async def _redraw_lcd(self):
         await self._lcd.clear()
+        if self.mode == Mode.MANAGED:
+            return
 
         # render the current color as 4 hex digits.
         await self._lcd.text(self.hexcolor[::2], (10, 10), 1)
 
         # render empty/filled circles to indicate the mode.
         for i in range(len(Mode) - 1):
-            active = i == self.mode.value
+            active = (i + 1) == self.mode.value
             x, y = 115, 5 + i * 15
             await self._lcd.ellipse((x, y, x + 10, y + 10), fill=active, outline=1)
 

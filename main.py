@@ -32,7 +32,7 @@ if __name__ == '__main__':
     managed_colors = {
         HM( 7,  0): '00201000',
         HM(19,  0): '50400030',
-        HM(19, 30): '20100000',
+        HM(19, 20): '20100000',
     }
 
     # Globe subprocess controls.
@@ -49,7 +49,7 @@ if __name__ == '__main__':
         global proc
         mode = m
         if proc:
-            await set_color('00000000')
+            await set_color('-1')
             proc.terminate()
         cmd = (sys.executable, 'globe.py', str(m.value))
         logging.info('starting globe: %s', cmd)

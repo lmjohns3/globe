@@ -19,6 +19,7 @@ import PIL.ImageFont
 import random
 import _rpi_ws281x as ws
 import sys
+import threading
 
 
 def profile(f):
@@ -41,18 +42,25 @@ class Mode(enum.Enum):
 
 
 def random_rgb():
-    '''Generate a random triple of ints in [0, 255], with a 0 for white.'''
+    '''Generate a random triple of ints in [0, 255], with a 0 white value.'''
     r = lambda: random.randrange(256)
     return r(), r(), r(), 0
 
 
 def hex_to_rgbw(x):
+    '''Convert a hex string to an RGBW tuple.
+
+    Hex strings are of the form RGB, RGBW, RRGGBB, or RRGGBBWW. Any missing
+    digits are assumed to be 0.
+
+    Hex strings may begin with an optional # character.
+    '''
     if x.startswith('#'):
         x = x[1:]
     if len(x) == 3:
         x += '0'
     if len(x) == 4:
-        return list(int(c, 16) for c in x)
+        return list(16 * int(c, 16) for c in x)
     if len(x) == 6:
         x += '00'
     if len(x) == 8:
@@ -61,61 +69,65 @@ def hex_to_rgbw(x):
     return None
 
 
-class LCD:
-    '''A class for driving an OLED LCD.'''
+class LCD(threading.Thread):
+    '''A class for driving an OLED LCD from a dedicated background thread.'''
 
     def __init__(self, pin, address):
+        super().__init__()
+
         self._disp = SSD1306.SSD1306_128_64(rst=pin, i2c_address=address)
         self._disp.begin()
 
         self._img = PIL.Image.new('1', (self._disp.width, self._disp.height))
         self._draw = PIL.ImageDraw.Draw(self._img)
         self._font = PIL.ImageFont.truetype('inconsolata.ttf', 48)
+        self._needs_refresh = True
 
     @profile
-    def _sync_clear(self):
+    def _clear(self):
         self._disp.clear()
 
     @profile
-    def _sync_image(self):
+    def _image(self):
         self._disp.image(self._img)
 
     @profile
-    def _sync_display(self):
+    def _display(self):
         self._disp.display()
 
-    async def _clear(self):
-        self._sync_clear()
+    def run(self):
+        while True:
+            if self._needs_refresh:
+                self._clear()
+                self._image()
+                self._display()
+                self._needs_refresh = False
+            time.sleep(0.5)
 
-    async def _image(self):
-        self._sync_image()
-
-    async def _display(self):
-        self._sync_display()
-
-    async def show(self):
-        await self._clear()
-        await self._image()
-        await self._display()
-
-    async def clear(self):
+    def clear(self):
         self._draw.rectangle((0, 0, self._disp.width, self._disp.height),
                              outline=0, fill=0)
+        self._needs_refresh = True
 
-    async def rectangle(self, coords, fill=0, outline=1):
+    def rectangle(self, coords, fill=0, outline=1):
         self._draw.rectangle(coords, fill=fill, outline=outline)
+        self._needs_refresh = True
 
-    async def ellipse(self, coords, fill=0, outline=1):
+    def ellipse(self, coords, fill=0, outline=1):
         self._draw.ellipse(coords, fill=fill, outline=outline)
+        self._needs_refresh = True
 
-    async def line(self, coords, fill=1):
+    def line(self, coords, fill=1):
         self._draw.line(coords, fill=fill)
+        self._needs_refresh = True
 
-    async def polygon(self, coords, fill=0, outline=1):
+    def polygon(self, coords, fill=0, outline=1):
         self._draw.polygon(coords, fill=fill, outline=outline)
+        self._needs_refresh = True
 
-    async def text(self, text, coords, fill=1):
+    def text(self, text, coords, fill=1):
         self._draw.text(coords, text, font=self._font, fill=fill)
+        self._needs_refresh = True
 
 
 class Gamma:
@@ -126,7 +138,11 @@ class Gamma:
 
 
 class Pixels:
-    '''A class representing a strip of NeoPixels.'''
+    '''A class representing a strip of NeoPixels.
+
+    This class is "asynchronous" and can be await-ed. The underlying hardware
+    call is synchronous, but tends to be very fast in practice.
+    '''
 
     def __init__(self, size, pin, brightness=128):
         self._size = size
@@ -235,8 +251,10 @@ class Globe:
         self.target = None
 
         self._lcd = LCD(pin=14, address=0x3d)
+        self._lcd.daemon = True
+        self._lcd.start()
+
         self._leds = Pixels(size=13, pin=18, brightness=255)
-        self._last_lcd_refresh = datetime.datetime.now()
 
         gpio = GPIO.get_platform_gpio()
 
@@ -262,27 +280,19 @@ class Globe:
         return ''.join('{:02x}'.format(c) for c in self.color)
 
     async def show(self):
-        now = datetime.datetime.now()
-        if (now - self._last_lcd_refresh).total_seconds() < 0.5:
-            asyncio.ensure_future(self._redraw_lcd())
-            self._last_lcd_refresh = now
+        self._redraw_lcd()
         await self._leds.show(self.color)
 
-    async def _redraw_lcd(self):
-        await self._lcd.clear()
-        if self.mode == Mode.MANAGED:
-            return
-
-        # render the current color as 4 hex digits.
-        await self._lcd.text(self.hexcolor[::2], (10, 10), 1)
-
-        # render empty/filled circles to indicate the mode.
-        for i in range(len(Mode) - 1):
-            active = (i + 1) == self.mode.value
-            x, y = 115, 5 + i * 15
-            await self._lcd.ellipse((x, y, x + 10, y + 10), fill=active, outline=1)
-
-        await self._lcd.show()
+    def _redraw_lcd(self):
+        self._lcd.clear()
+        if self.mode != Mode.MANAGED:
+            # render the current color as 4 hex digits.
+            self._lcd.text(self.hexcolor[::2], (10, 10), 1)
+            # render empty/filled circles to indicate the mode.
+            for i in range(len(Mode) - 1):
+                active = (i + 1) == self.mode.value
+                x, y = 115, 5 + i * 15
+                self._lcd.ellipse((x, y, x + 10, y + 10), fill=active, outline=1)
 
     async def _lava_loop(self):
         if self.target is None or self.color == self.target:
@@ -306,13 +316,10 @@ class Globe:
 
     def _on_color_pressed(self, idx):
         async def increment_color():
-            if self.mode == Mode.RGBW:
-                color = list(self.color)
-                value = color[idx]
-                value = (value - (value % 16) + 16) % 256
-                color[idx] = value
-                self.color = tuple(color)
-                asyncio.ensure_future(self.show())
+            color = list(self.color)
+            color[idx] = (color[idx] + 16) % 256
+            self.color = tuple(color)
+            asyncio.ensure_future(self.show())
         return increment_color
 
 
@@ -330,7 +337,12 @@ if __name__ == '__main__':
 
     async def set_color(req):
         data = await req.post()
-        globe.color = hex_to_rgbw(data['color'])
+        color = data['color']
+        if color == '-1':
+            globe.color = (0, 0, 0, 0)
+            globe._lcd.clear()
+        else:
+            globe.color = hex_to_rgbw(color)
         asyncio.ensure_future(globe.show())
         return aiohttp.web.Response(text='ok')
 
